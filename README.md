@@ -32,6 +32,10 @@ schmalal/
 │   ├── components.jsx    # Logo, Pill, Button, Waveform, Spinner …
 │   ├── views.jsx         # Idle / Uploading / Processing / Result / Error
 │   └── schmalal.css      # globals + @keyframes
+├── deploy/
+│   ├── schmalsoft-schmalal.service          # systemd-Unit (Hub-Konvention §3)
+│   └── apache-schmalal.schmalgsicht.de.conf # Apache-vhost (Hub-Konvention §4)
+├── start.sh              # manueller Gunicorn-Start für Smoke-Tests
 └── dist/                 # ← `npm run build`-Output, gitignored
 ```
 
@@ -73,13 +77,14 @@ npm run build                          # erzeugt dist/
 source .venv/bin/activate
 gunicorn \
   --workers 2 --threads 4 \
-  --bind 127.0.0.1:8000 \
+  --bind 127.0.0.1:8002 \
   --timeout 300 \
   app:app
 ```
 
 Flask serviert `dist/index.html` auf `/` und `dist/assets/*` auf `/assets/*`.
-Reverse-Proxy davor (siehe weiter unten), fertig.
+Apache davor (siehe [Deploy nach Schmalsoft-Konvention](#deploy-nach-schmalsoft-konvention)),
+fertig. `curl http://127.0.0.1:8002/health` muss `"status":"ok"` liefern.
 
 ## Env-Variablen
 
@@ -97,6 +102,8 @@ Reverse-Proxy davor (siehe weiter unten), fertig.
 | `SCHMALAL_RL_DOWNLOAD`      | `120 per hour`   | Rate-Limit für `/api/download` |
 | `SCHMALAL_RL_AUTH`          | `10 per minute`  | Brute-Force-Schutz für `/api/auth` |
 | `SCHMALAL_COOKIE_SECURE`    | unset            | Auf `1` setzen, wenn nur HTTPS — markiert Session-Cookie als `Secure` |
+| `APP_VERSION`               | aus `package.json` | Überschreibt die in `/health` gemeldete Version (z.B. Build-Kennung, max 60 Zeichen) |
+| `SCHMALAL_UPSTREAM_ERROR_WINDOW_SEC` | `300`   | Wie lange nach einem LALAL-Verbindungs-/5xx-Fehler `/health` den Check `lalal` als `degraded` meldet |
 
 Rate-Limits gelten **pro IP**. Wenn du hinter einem Reverse-Proxy bist, achte
 darauf, dass `X-Forwarded-For` ankommt (die Beispiel-Configs unten machen das).
@@ -140,95 +147,113 @@ Alle Tasks parallel, gepollt mit einem `POST /api/v1/check/`-Aufruf alle
 2,5 s. Splitter ist `auto`, Extraction-Level `deep_extraction`. Wer's mehr
 will: in `app.py` der Defaults oder im Frontend Custom-Form ergänzen.
 
-## Reverse Proxy
+## Deploy nach Schmalsoft-Konvention
 
-LALAL akzeptiert große Audiodateien — der Reverse-Proxy muss sie durchlassen.
-Wenn `SCHMALAL_MAX_BYTES` 100 MB ist, sind 200 MB im Proxy ein guter Puffer.
+Schmalal folgt der [Schmalsoft Produkt-Konvention](https://hub.schmalgsicht.de/docs/produkt-konvention.md)
+(Version 1, 2026-09-22), damit der Hub den Dienst ohne Sonderbehandlung
+überwacht. Die Vorlagen liegen in `deploy/`.
 
-### Nginx
+| Regel | Umsetzung in Schmalal |
+|---|---|
+| 1 Subdomain + Zertifikat | `schmalal.schmalgsicht.de`, `certbot --apache` |
+| 2 `GET /health` | siehe [Health-Endpunkt](#health-endpunkt) |
+| 3 systemd-Unit | `deploy/schmalsoft-schmalal.service`, User `schmalal` |
+| 4 Logs auf stdout/stderr | Flask-Logging und Gunicorn schreiben nach stderr → Journal |
+| 5 nur `127.0.0.1:<port>` | Gunicorn bindet `127.0.0.1:8002` |
+| 6 Version | aus `package.json`, in `/health` ausgegeben (Override: `APP_VERSION`) |
+| 7 `.env` außerhalb des Repos, `600` | `/etc/schmalsoft/schmalal.env` via `EnvironmentFile` |
+| 8 Daten unter `/var/lib/schmalsoft-schmalal/` | Schmalal hält keine Nutzerdaten auf Platte (alles wird zu LALAL gestreamt); Verzeichnis ist in der Unit trotzdem freigegeben |
+| 9 Eigene Apache-Logs | `deploy/apache-schmalal.schmalgsicht.de.conf` |
+| 10 Hub-Beacon | in `index.html`, `data-service="schmalal"` |
 
-```nginx
-server {
-    listen 443 ssl http2;
-    server_name schmalal.example.com;
+### Einrichten auf dem Server
 
-    client_max_body_size 200m;
+```bash
+# als root
+useradd --system --home-dir /var/www/schmalal.schmalgsicht.de --shell /usr/sbin/nologin schmalal
+mkdir -p /var/lib/schmalsoft-schmalal /etc/schmalsoft
+chown schmalal:schmalal /var/lib/schmalsoft-schmalal
 
-    proxy_read_timeout    300s;
-    proxy_send_timeout    300s;
-    proxy_connect_timeout 30s;
+# Code nach /var/www/schmalal.schmalgsicht.de, dann dort:
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+npm install && npm run build
+chown -R schmalal:schmalal /var/www/schmalal.schmalgsicht.de
 
-    proxy_request_buffering off;
-    proxy_buffering         off;
+# Env-Datei (Inhalt wie .env.example, mit echten Werten)
+install -m 640 -o root -g schmalal .env /etc/schmalsoft/schmalal.env
 
-    location / {
-        proxy_pass         http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-    }
+# systemd
+cp deploy/schmalsoft-schmalal.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now schmalsoft-schmalal.service
+journalctl -u schmalsoft-schmalal -n 20
+
+# Apache
+cp deploy/apache-schmalal.schmalgsicht.de.conf /etc/apache2/sites-available/schmalal.schmalgsicht.de.conf
+a2ensite schmalal.schmalgsicht.de && systemctl reload apache2
+certbot --apache -d schmalal.schmalgsicht.de
+
+# Prüfen
+curl -s http://127.0.0.1:8002/health
+systemctl restart schmalsoft-schmalal && systemctl status schmalsoft-schmalal
+```
+
+Zum Schluss im Hub-Katalog eintragen: Slug `schmalal`, Domain
+`schmalal.schmalgsicht.de`, Health-URL `https://schmalal.schmalgsicht.de/health`,
+Laufzeitart `systemd`, Unit `schmalsoft-schmalal.service`, Port `8002`,
+Versionsquelle `package.json`.
+
+Migration von `screen`/`start.sh`: alten Prozess beenden, Unit wie oben
+starten. `start.sh` bleibt für manuelle Smoke-Tests.
+
+### Apache-Details
+
+LALAL akzeptiert große Audiodateien — der Proxy muss sie durchlassen. Wenn
+`SCHMALAL_MAX_BYTES` 100 MB ist, sind 200 MB (`LimitRequestBody 209715200`)
+ein guter Puffer, außerdem `Timeout 300` und `ProxyTimeout 300`. Die vhost-
+Vorlage setzt das im `:80`-Block; certbot legt den `:443`-Block an, dort die
+gleichen drei Zeilen ergänzen. Rate-Limits gelten pro IP, daher muss
+`X-Forwarded-For` ankommen (`ProxyPreserveHost On` + mod_proxy machen das).
+
+**Achtung beim Umbau eines bestehenden vhosts:** wenn Apache bisher nur
+`/api/*` an Gunicorn weiterreicht und `dist/` selbst ausliefert, erreicht
+`GET /health` Flask nicht (Apache antwortet 404, der Hub sieht keinen
+Health-Status). Entweder wie in der Vorlage alles auf `/` proxyen, oder
+zusätzlich `ProxyPass /health http://127.0.0.1:8002/health` eintragen.
+
+## Health-Endpunkt
+
+`GET /health` — ohne Auth, ohne Rate-Limit, `Cache-Control: no-store`,
+antwortet in Millisekunden. `/api/healthz` ist ein Alias für bestehende Checks.
+
+```json
+{
+  "status": "ok",
+  "service": "schmalal",
+  "version": "0.2.0",
+  "uptime": 86400,
+  "checks": {
+    "license": "ok",
+    "frontend": "ok",
+    "auth_gate": "ok",
+    "lalal": "ok"
+  },
+  "time": "2026-09-22T17:00:00Z"
 }
 ```
 
-### Apache 2.4
+| Check | `ok` | `degraded` | `error` |
+|---|---|---|---|
+| `license` | `LALAL_LICENSE` gesetzt | — | fehlt → jeder API-Call scheitert |
+| `frontend` | `dist/index.html` vorhanden | — | fehlt → `/` liefert 503 |
+| `auth_gate` | Rhythm- oder PIN-Gate aktiv | kein Gate → Instanz offen | — |
+| `lalal` | letzter echter LALAL-Call ok | Verbindungsfehler oder 5xx innerhalb `SCHMALAL_UPSTREAM_ERROR_WINDOW_SEC` | — |
 
-```apache
-<VirtualHost *:443>
-    ServerName schmalal.example.com
-
-    LimitRequestBody 209715200      # 200 MB
-    Timeout 300
-    ProxyTimeout 300
-
-    SSLEngine on
-    SSLCertificateFile      /etc/letsencrypt/live/schmalal.example.com/fullchain.pem
-    SSLCertificateKeyFile   /etc/letsencrypt/live/schmalal.example.com/privkey.pem
-
-    ProxyPreserveHost On
-    ProxyRequests Off
-    SetEnv proxy-sendchunked 1
-
-    ProxyPass        / http://127.0.0.1:8000/
-    ProxyPassReverse / http://127.0.0.1:8000/
-
-    RequestHeader set X-Forwarded-Proto "https"
-</VirtualHost>
-```
-
-## systemd Beispiel
-
-```ini
-# /etc/systemd/system/schmalal.service
-[Unit]
-Description=Schmalal — LALAL stem splitter proxy
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/schmalal
-EnvironmentFile=/etc/schmalal.env
-ExecStart=/opt/schmalal/.venv/bin/gunicorn \
-    --workers 2 --threads 4 \
-    --bind 127.0.0.1:8000 --timeout 300 \
-    app:app
-Restart=on-failure
-RestartSec=3
-User=schmalal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Mit `/etc/schmalal.env`:
-
-```
-LALAL_LICENSE=dein-license-key
-SCHMALAL_PIN=etwas-langes
-SCHMALAL_SECRET_KEY=...64-hex-zeichen-aus-secrets.token_hex(32)...
-SCHMALAL_COOKIE_SECURE=1
-```
+`status` ist `error` (HTTP 503), sobald ein Check `error` ist, sonst
+`degraded`, sobald einer `degraded` ist, sonst `ok`. Der `lalal`-Check probt
+LALAL **nicht** aktiv (der Hub fragt alle 30 s), sondern wertet die letzten
+echten Upload/Split/Check-Aufrufe aus. Ein frisch gestarteter Prozess meldet
+daher `ok`, bis ein Nutzer einen Fehler auslöst.
 
 ## Auth-Gates im Detail
 
@@ -262,7 +287,8 @@ Brute-Force-Bypass.
 |---------|----------------------------|------|-------------------------|----------------------------------------------------------|
 | GET     | `/`                        | —    | —                       | Vite `dist/index.html`                                   |
 | GET     | `/assets/*`                | —    | —                       | Vite-Build-Assets                                        |
-| GET     | `/api/healthz`             | —    | —                       | Server-Status                                            |
+| GET     | `/health`                  | —    | —                       | Hub-Health-JSON (`status`, `service`, `version`, `checks`) |
+| GET     | `/api/healthz`             | —    | —                       | Alias für `/health`                                      |
 | GET     | `/api/me`                  | —    | —                       | Auth-Status + welche Gates konfiguriert sind             |
 | POST    | `/api/auth`                | —    | `RL_AUTH`               | `{notes:[60,62,67]}` oder `{pin:"3333"}`                 |
 | POST    | `/api/logout`              | —    | —                       | session.clear()                                          |
@@ -275,8 +301,10 @@ Brute-Force-Bypass.
 ## Bekannte Stolpersteine
 
 - **Frontend leer + 503 mit „Frontend not built":** `npm run build` vergessen.
-- **Upload bricht sofort ab:** Reverse-Proxy `client_max_body_size` /
-  `LimitRequestBody` zu klein.
+- **Upload bricht sofort ab:** Apache `LimitRequestBody` zu klein.
+- **Hub zeigt `degraded` mit `auth_gate`:** weder `SCHMALAL_RHYTHM_INTERVALS`
+  noch `SCHMALAL_PIN` gesetzt — Instanz ist öffentlich.
+- **Hub zeigt `error` mit `frontend`:** `npm run build` auf dem Server vergessen.
 - **Upload bricht nach ~30s ab:** Gunicorn-Timeout zu niedrig (Default 30s).
   `--timeout 300`.
 - **„auth required" trotz korrektem Code:** entweder `SCHMALAL_SECRET_KEY`
