@@ -48,8 +48,15 @@ if [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" fetch -q origin "$BRANCH"
   git -C "$APP_DIR" reset -q --hard "origin/$BRANCH"
 else
-  [ -e "$APP_DIR" ] && [ -n "$(ls -A "$APP_DIR" 2>/dev/null)" ] \
-    && die "$APP_DIR existiert und ist kein Git-Checkout. Bitte wegräumen oder APP_DIR anders setzen."
+  if [ -e "$APP_DIR" ] && [ -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]; then
+    # Nur ein alter statischer Build (index.html + assets)? Dann beiseite legen.
+    if [ -f "$APP_DIR/index.html" ] && [ ! -f "$APP_DIR/app.py" ]; then
+      OLD="$APP_DIR.static-$(date +%Y%m%d-%H%M%S)"
+      mv "$APP_DIR" "$OLD"; echo "alter statischer Build nach $OLD verschoben"
+    else
+      die "$APP_DIR existiert und ist kein Git-Checkout. Bitte wegräumen oder APP_DIR anders setzen."
+    fi
+  fi
   git clone -q -b "$BRANCH" "$REPO" "$APP_DIR"
 fi
 VERSION=$(python3 -c "import json;print(json.load(open('$APP_DIR/package.json'))['version'])")
@@ -114,9 +121,14 @@ sleep 2
 systemctl is-active --quiet "$UNIT" || { journalctl -u "$UNIT" -n 30 --no-pager; die "$UNIT läuft nicht."; }
 
 # ─── 7. Apache-vhost (Regel 1, 9) ─────────────────────────────────────────
+# SKIP_APACHE=1, wenn der vhost woanders gepflegt wird (auf schmalgsicht.de
+# liegt schmalal in den geteilten schmalgsicht.de*.conf-Dateien; dort muss
+# DocumentRoot auf $APP_DIR/dist zeigen und /api/ + /health proxied werden).
 log "Apache-vhost $DOMAIN"
 SITE="/etc/apache2/sites-available/$DOMAIN.conf"
-if [ ! -f "$SITE" ]; then
+if [ "${SKIP_APACHE:-0}" = 1 ]; then
+  echo "übersprungen (SKIP_APACHE=1)"
+elif [ ! -f "$SITE" ]; then
   install -m 644 "$APP_DIR/deploy/apache-$DOMAIN.conf" "$SITE"
   echo "vhost angelegt"
 else
@@ -127,11 +139,13 @@ else
   fi
   grep -q "$DOMAIN-access.log" "$SITE" || echo "WARNUNG: $SITE hat keine eigene access.log (Regel 9)."
 fi
+if [ "${SKIP_APACHE:-0}" != 1 ]; then
 a2enmod -q proxy proxy_http headers ssl >/dev/null 2>&1 || true
 a2ensite -q "$DOMAIN" >/dev/null 2>&1 || true
 apache2ctl configtest
 systemctl reload apache2
-if [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+fi
+if [ "${SKIP_APACHE:-0}" != 1 ] && [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
   if command -v certbot >/dev/null; then
     certbot --apache -n --agree-tos --redirect -d "$DOMAIN" --register-unsafely-without-email \
       || echo "WARNUNG: certbot fehlgeschlagen, Zertifikat manuell holen: certbot --apache -d $DOMAIN"
