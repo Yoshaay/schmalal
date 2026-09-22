@@ -2,7 +2,8 @@
 # Startet das Schmalal-Backend mit Gunicorn auf 127.0.0.1:8002.
 # Apache leitet /api/* dorthin weiter. Statische Files serviert Apache selbst.
 #
-# Für Production besser über systemd (siehe README) — Auto-Restart, Boot-Start, Logs in journalctl.
+# Für Production läuft der Dienst als systemd-Unit schmalsoft-schmalal.service
+# (deploy/schmalsoft-schmalal.service) — Auto-Restart, Boot-Start, Logs in journalctl.
 # Dieses Skript ist für manuelles Hochfahren / Smoke-Tests.
 
 set -euo pipefail

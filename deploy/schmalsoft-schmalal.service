@@ -1,0 +1,42 @@
+# /etc/systemd/system/schmalsoft-schmalal.service
+# Schmalsoft Produkt-Konvention, Abschnitt 3. Unit-Name, User, Env-Datei und
+# Datenverzeichnis folgen dem Namensschema schmalsoft-<slug>.
+#
+# Einrichten (als root):
+#   useradd --system --home-dir /var/www/schmalal.schmalgsicht.de --shell /usr/sbin/nologin schmalal
+#   chown -R schmalal:schmalal /var/www/schmalal.schmalgsicht.de
+#   mkdir -p /var/lib/schmalsoft-schmalal /etc/schmalsoft
+#   chown schmalal:schmalal /var/lib/schmalsoft-schmalal
+#   install -m 640 -o root -g schmalal .env /etc/schmalsoft/schmalal.env
+#   cp deploy/schmalsoft-schmalal.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now schmalsoft-schmalal.service
+
+[Unit]
+Description=Schmalal — LALAL.AI stem splitter proxy
+After=network.target
+
+[Service]
+Type=simple
+User=schmalal
+Group=schmalal
+WorkingDirectory=/var/www/schmalal.schmalgsicht.de
+EnvironmentFile=/etc/schmalsoft/schmalal.env
+ExecStart=/var/www/schmalal.schmalgsicht.de/.venv/bin/gunicorn \
+    --workers 2 --threads 4 \
+    --timeout 300 \
+    --bind 127.0.0.1:8002 \
+    app:app
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=schmalal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/schmalsoft-schmalal
+
+[Install]
+WantedBy=multi-user.target
