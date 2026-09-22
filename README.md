@@ -206,6 +206,12 @@ Versionsquelle `package.json`.
 Migration von `screen`/`start.sh`: alten Prozess beenden, Unit wie oben
 starten. `start.sh` bleibt für manuelle Smoke-Tests.
 
+**Stand auf schmalgsicht.de (seit 2026-09-22):** läuft so. Der vhost liegt
+dort nicht als eigene Datei, sondern als Block in
+`/etc/apache2/sites-enabled/schmalgsicht.de-le-ssl.conf` (echte Datei, kein
+Symlink) mit `DocumentRoot …/dist`, Proxy für `/api/` und `/health`.
+Updates: `deploy/server-setup.sh` mit `SKIP_APACHE=1` ausführen.
+
 ### Apache-Details
 
 LALAL akzeptiert große Audiodateien — der Proxy muss sie durchlassen. Wenn
