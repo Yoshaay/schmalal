@@ -34,7 +34,28 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 # ─── Config ────────────────────────────────────────────────────────────────
+HERE = os.path.dirname(os.path.abspath(__file__))
 LALAL_BASE = "https://www.lalal.ai/api/v1"
+
+# Schmalsoft Hub conventions: service slug + version (rule 2/6). Version comes
+# from package.json next to this file so the Hub's fallback probe and /health
+# agree; APP_VERSION in env overrides it (e.g. for a build identifier).
+SERVICE_SLUG = "schmalal"
+STARTED_AT = time.time()
+
+
+def _read_version() -> str:
+    env_v = (os.environ.get("APP_VERSION") or "").strip()
+    if env_v:
+        return env_v[:60]
+    try:
+        with open(os.path.join(HERE, "package.json"), encoding="utf-8") as fh:
+            return str(json.load(fh).get("version") or "0.0.0")[:60]
+    except (OSError, ValueError):
+        return "0.0.0"
+
+
+VERSION = _read_version()
 LICENSE = (os.environ.get("LALAL_LICENSE") or "").strip()
 # 4-digit numeric code as the rhythm-gate fallback. Anything that's not exactly
 # 4 digits is rejected at startup so we don't accidentally accept "" or "abc".
@@ -111,6 +132,48 @@ if RHYTHM_ENABLED:
     log.info("rhythm gate active: %d notes, intervals=%s", len(RHYTHM_INTERVALS) + 1, RHYTHM_INTERVALS)
 if PIN:
     log.info("pin gate active (4 digits)")
+
+
+# ─── LALAL upstream tracking (feeds /health, no extra upstream calls) ──────
+# /health must answer in <1 s and is polled every 30 s, so we never probe LALAL
+# from it. Instead every real proxied call records its outcome here and
+# /health reports "degraded" if the most recent call failed within the window.
+UPSTREAM_ERROR_WINDOW_SEC = int(os.environ.get("SCHMALAL_UPSTREAM_ERROR_WINDOW_SEC") or 300)
+_upstream_state = {"last_ok": 0.0, "last_error": 0.0, "last_error_msg": ""}
+_upstream_lock = threading.Lock()
+
+
+def _note_upstream(ok: bool, msg: str = ""):
+    with _upstream_lock:
+        if ok:
+            _upstream_state["last_ok"] = time.time()
+        else:
+            _upstream_state["last_error"] = time.time()
+            _upstream_state["last_error_msg"] = (msg or "")[:200]
+
+
+def _upstream_check() -> str:
+    """'ok' | 'degraded' for the LALAL dependency, based on recent real calls."""
+    with _upstream_lock:
+        last_ok = _upstream_state["last_ok"]
+        last_err = _upstream_state["last_error"]
+    if last_err and last_err > last_ok and time.time() - last_err < UPSTREAM_ERROR_WINDOW_SEC:
+        return "degraded"
+    return "ok"
+
+
+def _lalal_post(url: str, **kwargs) -> requests.Response:
+    """requests.post to LALAL that records connectivity/5xx outcomes for /health."""
+    try:
+        resp = requests.post(url, **kwargs)
+    except requests.RequestException as e:
+        _note_upstream(False, str(e))
+        raise
+    if resp.status_code >= 500:
+        _note_upstream(False, f"HTTP {resp.status_code}")
+    else:
+        _note_upstream(True)
+    return resp
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
@@ -238,14 +301,51 @@ def index():
     return send_from_directory(DIST, "index.html")
 
 
+# ─── Health (Schmalsoft Hub convention, section 2) ─────────────────────────
+def _health_payload():
+    checks = {}
+    status = "ok"
+
+    # Without a license key every proxied call fails → not functional.
+    checks["license"] = "ok" if LICENSE else "error"
+    # Frontend bundle missing → "/" answers 503, users see nothing.
+    checks["frontend"] = "ok" if os.path.exists(os.path.join(DIST, "index.html")) else "error"
+    # No auth gate = open to anyone who finds the URL. Runs, but not as intended.
+    checks["auth_gate"] = "ok" if _gate_required() else "degraded"
+    # LALAL reachability, derived from recent real calls (no probe from here).
+    checks["lalal"] = _upstream_check()
+
+    if "error" in checks.values():
+        status = "error"
+    elif "degraded" in checks.values():
+        status = "degraded"
+
+    return {
+        "status": status,
+        "service": SERVICE_SLUG,
+        "version": VERSION,
+        "uptime": int(time.time() - STARTED_AT),
+        "checks": checks,
+        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+@app.route("/health")
+@limiter.exempt
+def health():
+    payload = _health_payload()
+    resp = jsonify(payload)
+    resp.status_code = 503 if payload["status"] == "error" else 200
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 # ─── Public API ────────────────────────────────────────────────────────────
 @app.route("/api/healthz")
+@limiter.exempt
 def healthz():
-    return jsonify({
-        "ok": True,
-        "license_configured": bool(LICENSE),
-        "gate_required": _gate_required(),
-    })
+    """Legacy alias for /health (kept for existing external checks)."""
+    return health()
 
 
 @app.route("/api/me")
@@ -333,7 +433,7 @@ def upload():
     headers["Content-Disposition"] = _content_disposition(f.filename)
 
     try:
-        upstream = requests.post(
+        upstream = _lalal_post(
             f"{LALAL_BASE}/upload/",
             headers=headers,
             data=f.stream,
@@ -356,7 +456,7 @@ def upload():
         sid = data.get("id")
         if sid:
             try:
-                requests.post(
+                _lalal_post(
                     f"{LALAL_BASE}/delete/",
                     json={"source_id": sid},
                     headers=_require_license(),
@@ -440,7 +540,7 @@ def split():
             results.append({"source_id": job.get("source_id"), "status": "error", "error": str(e)})
             continue
         try:
-            resp = requests.post(url, json=body, headers=headers, timeout=UPSTREAM_TIMEOUT)
+            resp = _lalal_post(url, json=body, headers=headers, timeout=UPSTREAM_TIMEOUT)
         except requests.RequestException as e:
             log.warning("split upstream error: %s", e)
             results.append({"source_id": job.get("source_id"), "status": "error", "error": f"upstream: {e}"})
@@ -486,7 +586,7 @@ def check():
 
     headers = _require_license()
     try:
-        resp = requests.post(
+        resp = _lalal_post(
             f"{LALAL_BASE}/check/",
             json={"task_ids": task_ids},
             headers=headers,
@@ -525,7 +625,7 @@ def cancel():
 
     headers = _require_license()
     try:
-        resp = requests.post(
+        resp = _lalal_post(
             f"{LALAL_BASE}/delete/",
             json={"source_id": source_id},
             headers=headers,
