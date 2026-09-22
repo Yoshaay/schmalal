@@ -1,0 +1,52 @@
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: #FAF7F2;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Inter Tight', system-ui, sans-serif;
+  color: #171513;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+*::selection {
+  background: #D946EF;
+  color: #fff;
+}
+
+input {
+  font-family: inherit;
+}
+
+@keyframes hfPulse {
+  from { transform: scaleY(0.5); }
+  to   { transform: scaleY(1); }
+}
+
+@keyframes hfBlink {
+  50% { opacity: 0.3; }
+}
+
+@keyframes hfSpin {
+  to { transform: rotate(360deg); }
+}
+
+.pin-cell:focus {
+  border-color: #D946EF !important;
+  box-shadow: 0 0 0 4px rgba(217, 70, 239, 0.12) !important;
+}
+
+@keyframes hfShake {
+  0%, 100% { transform: translateX(0); }
+  20%      { transform: translateX(-8px); }
+  40%      { transform: translateX(8px); }
+  60%      { transform: translateX(-5px); }
+  80%      { transform: translateX(5px); }
+}
